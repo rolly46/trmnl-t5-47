@@ -1,0 +1,10 @@
+
+This directory is intended for project header files.
+
+A header file is a file containing C declarations and macro definitions
+to be shared between several project source files. Request for including
+a header file in a program source file is done by the C preprocessing
+directive "#include".
+
+For more information on PlatformIO project structure, see:
+https://docs.platformio.org/page/projectconf/sections/platformio/options/directory/include_dir.html
