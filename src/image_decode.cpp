@@ -14,14 +14,15 @@ struct PngContext {
 };
 
 // Set a single pixel in the 4bpp framebuffer
-// 0x0 = black, 0xF = white (epdiy convention)
+// EPD47 convention: even x -> low nibble, odd x -> high nibble
+// 0x0 = black, 0xF = white
 void ImageDecoder::setPixel4bpp(uint8_t *fb, int fbWidth, int x, int y, uint8_t gray4) {
     if (x < 0 || x >= fbWidth || y < 0 || y >= DISPLAY_HEIGHT) return;
     int idx = (y * fbWidth + x) / 2;
     if (x & 1) {
-        fb[idx] = (fb[idx] & 0xF0) | (gray4 & 0x0F);
-    } else {
         fb[idx] = (fb[idx] & 0x0F) | ((gray4 & 0x0F) << 4);
+    } else {
+        fb[idx] = (fb[idx] & 0xF0) | (gray4 & 0x0F);
     }
 }
 
@@ -39,33 +40,70 @@ static int pngDrawCallback(PNGDRAW *pDraw) {
         if (destX < 0 || destX >= ctx->fbWidth) continue;
 
         uint8_t gray8;
-        switch (pDraw->iBpp) {
-            case 1: { // 1-bit
-                uint8_t bit = (line[i / 8] >> (7 - (i & 7))) & 1;
-                gray8 = bit ? 255 : 0;
-                break;
+        if (pDraw->iPixelType == PNG_PIXEL_INDEXED) {
+            // Indexed PNG: extract palette index from packed pixels
+            uint8_t idx;
+            switch (pDraw->iBpp) {
+                case 1: {
+                    idx = (line[i / 8] >> (7 - (i & 7))) & 1;
+                    break;
+                }
+                case 2: {
+                    idx = (line[i / 4] >> (6 - (i & 3) * 2)) & 0x03;
+                    break;
+                }
+                case 4: {
+                    idx = (i & 1) ? (line[i / 2] & 0x0F) : ((line[i / 2] >> 4) & 0x0F);
+                    break;
+                }
+                case 8:
+                    idx = line[i];
+                    break;
+                default:
+                    idx = 0;
+                    break;
             }
-            case 4: { // 4-bit grayscale
-                if (i & 1) gray8 = (line[i / 2] & 0x0F) * 17;
-                else gray8 = ((line[i / 2] >> 4) & 0x0F) * 17;
-                break;
+            // Palette is RGB triplets at pPalette[idx * 3]
+            uint8_t r = pDraw->pPalette[idx * 3];
+            uint8_t g = pDraw->pPalette[idx * 3 + 1];
+            uint8_t b = pDraw->pPalette[idx * 3 + 2];
+            gray8 = (uint8_t)(0.299f * r + 0.587f * g + 0.114f * b);
+        } else {
+            // Grayscale, truecolor, or gray+alpha
+            switch (pDraw->iBpp) {
+                case 1: { // 1-bit grayscale
+                    uint8_t bit = (line[i / 8] >> (7 - (i & 7))) & 1;
+                    gray8 = bit ? 255 : 0;
+                    break;
+                }
+                case 2: { // 2-bit grayscale
+                    uint8_t byte = line[i / 4];
+                    int shift = 6 - (i & 3) * 2;
+                    gray8 = ((byte >> shift) & 0x03) * 85; // 0->0, 1->85, 2->170, 3->255
+                    break;
+                }
+                case 4: { // 4-bit grayscale
+                    if (i & 1) gray8 = (line[i / 2] & 0x0F) * 17;
+                    else gray8 = ((line[i / 2] >> 4) & 0x0F) * 17;
+                    break;
+                }
+                case 8: // 8-bit grayscale
+                    gray8 = line[i];
+                    break;
+                case 24: { // RGB
+                    int off = i * 3;
+                    gray8 = (uint8_t)(0.299f * line[off] + 0.587f * line[off + 1] + 0.114f * line[off + 2]);
+                    break;
+                }
+                case 32: { // RGBA
+                    int off = i * 4;
+                    gray8 = (uint8_t)(0.299f * line[off] + 0.587f * line[off + 1] + 0.114f * line[off + 2]);
+                    break;
+                }
+                default:
+                    gray8 = 128;
+                    break;
             }
-            case 8: // 8-bit grayscale or palette index
-                gray8 = line[i];
-                break;
-            case 24: { // RGB
-                int off = i * 3;
-                gray8 = (uint8_t)(0.299f * line[off] + 0.587f * line[off + 1] + 0.114f * line[off + 2]);
-                break;
-            }
-            case 32: { // RGBA
-                int off = i * 4;
-                gray8 = (uint8_t)(0.299f * line[off] + 0.587f * line[off + 1] + 0.114f * line[off + 2]);
-                break;
-            }
-            default:
-                gray8 = 128;
-                break;
         }
 
         // Map 0-255 to 4-bit: 0x0=black, 0xF=white
@@ -73,9 +111,9 @@ static int pngDrawCallback(PNGDRAW *pDraw) {
 
         int idx = (destY * ctx->fbWidth + destX) / 2;
         if (destX & 1) {
-            ctx->framebuffer[idx] = (ctx->framebuffer[idx] & 0xF0) | (gray4 & 0x0F);
-        } else {
             ctx->framebuffer[idx] = (ctx->framebuffer[idx] & 0x0F) | ((gray4 & 0x0F) << 4);
+        } else {
+            ctx->framebuffer[idx] = (ctx->framebuffer[idx] & 0xF0) | (gray4 & 0x0F);
         }
     }
     return 1;
@@ -272,17 +310,22 @@ DecodeResult ImageDecoder::decodeBMP(uint8_t *data, size_t length, uint8_t *fram
 }
 
 DecodeResult ImageDecoder::decodePNG(uint8_t *data, size_t length, uint8_t *framebuffer, int fbWidth, int fbHeight) {
-    PNG png;
+    PNG *png = new PNG();
+    if (!png) {
+        Serial.println("[TRMNL] Failed to allocate PNG decoder");
+        return DecodeResult::OUT_OF_MEMORY;
+    }
 
-    int rc = png.openRAM(data, length, pngDrawCallback);
+    int rc = png->openRAM(data, length, pngDrawCallback);
     if (rc != PNG_SUCCESS) {
         Serial.printf("[TRMNL] PNG open failed: %d\n", rc);
+        free(png);
         return DecodeResult::DECODE_FAILED;
     }
 
-    int imgWidth = png.getWidth();
-    int imgHeight = png.getHeight();
-    Serial.printf("[TRMNL] PNG: %dx%d, bpp=%d\n", imgWidth, imgHeight, png.getBpp());
+    int imgWidth = png->getWidth();
+    int imgHeight = png->getHeight();
+    Serial.printf("[TRMNL] PNG: %dx%d, bpp=%d\n", imgWidth, imgHeight, png->getBpp());
 
     PngContext ctx;
     ctx.framebuffer = framebuffer;
@@ -293,8 +336,9 @@ DecodeResult ImageDecoder::decodePNG(uint8_t *data, size_t length, uint8_t *fram
     if (ctx.offsetX < 0) ctx.offsetX = 0;
     if (ctx.offsetY < 0) ctx.offsetY = 0;
 
-    rc = png.decode(&ctx, 0);
-    png.close();
+    rc = png->decode(&ctx, 0);
+    png->close();
+    free(png);
 
     if (rc != PNG_SUCCESS) {
         Serial.printf("[TRMNL] PNG decode failed: %d\n", rc);
